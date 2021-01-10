@@ -60,10 +60,14 @@ class Node:
         self.d_zc = d_zc
         self.d_zu = d_zu
 
-        self.zcs = tf.ones((self.d_zc,))
-        self.zus = tf.zeros((self.d_zu,))
+        self.reset_states()
 
         self.child_targets = list() # N-list< [(N_samples)-Tensor, (N_samples,self.d_zc)-Dist] >
+
+    def reset_states(self):
+        """called before beginning a new episode or training on collected data"""
+        self.zcs = tf.ones((self.d_zc,))
+        self.zus = tf.zeros((self.d_zu,))
 
     def bottom_up(self):
         """sensory nodes should override this function to update `self.zcs`"""
@@ -76,53 +80,83 @@ class Node:
 
 class InformationNode(Node):
     """
-    member functions should all be called in their declared order
+    Similar to a node in a Bayesian network, an `InformationNode` has parents forming
+    its receptive field, children that it directly influences, and neighbors that may
+    or may not share the same parents.
 
-    all functions are `Tensor` -> `Dist`
-    `f_abs: [(N_samples, self.d_zc),
-             (N_samples, parent1.d_zc),
-             (N_samples, parent2.d_zc),
-             (N_samples, parent3.d_zc),
+    Internally, `InformationNode` builds a recurrent latent representation of its receptive
+    field for next-frame latent representation prediction accuracy. It then acts to fulfill
+    the predictions it makes by sending expected observation targets to Nodes in its receptive
+    field. It also attempts to fulfill the targets from `Node`'s that it forms the receptive
+    field for. It also takes into consideration the predictions of its neighbors when forming
+    its own predictions and gives more attention to minimum entropy target states.
+
+    To prevent zero-representation collapse, `f_abs` should also include some
+    unsupervised bottom-up representation mechanisms which the latent state is only
+    able to modify but not completely ignore.Optionally, the anticipated representation
+    is subtracted from what is actually formed if `predictive_coding` is enabled.
+
+
+    Functional Structure:
+    All functions are `Tensor` -> `Dist`
+    These functions' `Dist` outputs are fully recognized as such and not
+    treated as `Tensor`'s until calling `.sample`. This means they can have
+    `tfpl.Layer`'s output `Dist`'s propagated through `Bijector`'s in their
+    final layers without issues.
+
+    `f_abs: [self.zcs:    (N_samples, self.d_zc),
+             parent1.zcs: (N_samples, parent1.d_zc),
+             parent2.zcs: (N_samples, parent2.d_zc),
+             parent3.zcs: (N_samples, parent3.d_zc),
              ...,
-             (N_samples, self.d_zu),
-             (N_samples, parent1.d_zu),
-             (N_samples, parent2.d_zu),
-             (N_samples, parent3.d_zu),
+             self.zus:    (N_samples, self.d_zu),
+             parent1.zus: (N_samples, parent1.d_zu),
+             parent2.zus: (N_samples, parent2.d_zu),
+             parent3.zus: (N_samples, parent3.d_zu),
              ...]
-              -> (B: N_samples E: self.d_zc)`
+            -> self.Zcs: (B: N_samples E: self.d_zc)`
 
-    `f_pred: [(N_samples, self.d_zc), (self.d_zu)] -> (B: N_samples E: self.d_zc)`
+    `f_pred: [self.zcs: (N_samples, self.d_zc),
+              self.zus: (self.d_zu)]
+             -> self.Zcpreds (B: N_samples E: self.d_zc)`
 
-    `f_act: [(N_samples, self.d_zc),  # zc
-             (N_samples, self.d_zu),  # zu
-             (N_samples, self.d_zc)]  # ztarget
-            -> [(N_samples, parent1.d_zc),
-                (N_samples, parent2.d_zc),
-                (N_samples, parent3.d_zc),
+    `f_act: [self.zcs: (N_samples, self.d_zc),
+             self.zus: (N_samples, self.d_zu),
+             ztargets: (N_samples, self.d_zc)]
+            -> [ztargets for parent1: (N_samples, parent1.d_zc),
+                ztargets for parent2: (N_samples, parent2.d_zc),
+                ztargets for parent3: (N_samples, parent3.d_zc),
                 ...]`
 
-    `f_trans: [(N_samples, neighbor.d_zc), (neighbor.d_zu)] -> (B: N_samples E: self.d_zc)`
+    `f_trans: [neighbor.zcs: (N_samples, neighbor.d_zc),
+               neighbor.zus: (neighbor.d_zu)]
+              -> zcs (translated): (B: N_samples E: self.d_zc)`
 
+    Although `f_act` outputs a list of independent `Distributions`, they are really
+    dependant. This should be modeled by using a/some `ConvertToTensor` `tfpl.Layer` in
+    the bottleneck layers of `f_act`
 
-    naming convention:
-    `CAPITAL`/`lowercase`: distribution/plain-old tensor
-    `-`/`-s`: single/batch
+    Naming Convention:
+    `CAPITAL`/`lowercase`: distribution / real-valued number
+    `x`/`z`: observation (from parents) / latent (internal state)
+    `-c`/`-u`: controllable / uncontrollable
+    `-`/`-s`: single / sample batch
 
-    `x`/`z`: observation (from parents)/latent (autonomous)
-    `-c`/`-u`: controllable/uncontrollable
-
-    type specification:
-    `line of code returning object # SHAPE-TYPENAME<GENERIC PARAMS>`
+    Type Specification Syntax:
+    `Line of code returning object # SHAPE-TYPENAME<GENERIC PARAMS>`
+    and in pseudocode `obj: SHAPE-TYPENAME<GENERIC PARAMS>`.
     SHAPE and GENERIC PARAMS are optional. eg:
     `self.nodes = [node1, node2, node3] # 3-list<InformationNode>`
         means `self.nodes` is a list of 3 `InformationNode` objects
     I also use literal `[]`'s to refer to specifically enumerated element types. eg:
     `self.neighbors = list() # (N_neighbors)-list<[node,
-        ((N_samples, neighbor.dzc,)-Tensor) -> (B: N_samples, E: self.dzc,)-Dist] >`
+        ((N_samples, neighbor.dzc,)-Tensor) -> (B: N_samples, E: self.dzc,)-Dist]>`
         means `self.neighbors` is an (N_neighbors x 2) list with `Node`'s in the
         first column and probabilistic functions in the second.
-
     I also employ `inline_var: type` specifications
+    For conciseness, I abbreviate `tfp.distributions.Distribution` as `Dist`
+
+    `InformationNode` member functions should all be called in their declared order
     """
 
     NAME_COUNTER = 0
@@ -141,18 +175,17 @@ class InformationNode(Node):
         self.f_act = f_act
         self.f_pred = f_pred
 
-        # self.f_abs.compile(loss=lambda y_true, y_pred: y_pred.log_prob(y_true))
-        # self.f_act.compile(loss=lambda y_true, y_pred: y_pred.log_prob(y_true))
-        # self.f_pred.compile(loss=lambda y_true, y_pred: y_pred.log_prob(y_true))
-
-        self.hparams = hparams
-        self.record = dict() # `record` is progressively defined during bottom_up and top_down
-        self.buffer = list() # list<tuple<?-Tensor>>
-
         self.parents = list() # list<Node>
         self.neighbors = dict() # dict< Node, callable>
         # callable is the controllable latent translator:
         # ((N_samples, neighbor.d_zc)-Tensor)->(N_samples, self.d_zc)-Tensor
+
+        self.hparams = hparams
+        self.record = dict() # `record` is progressively defined during bottom_up and top_down
+        self.buffer = list() # list<dict<str, Tensor>>
+
+        self.predictive_coding = 'predictive_coding' in self.hparams \
+                                 and self.hparams['predictive_coding']
 
         if name is None:
             name = f'InformationNode{InformationNode.NAME_COUNTER}'
@@ -179,14 +212,18 @@ class InformationNode(Node):
         self.w_act = self.f_act.trainable_weights
         self.optimizer = keras.optimizers.SGD(5e-3)
 
+    def reset_states(self):
+        super(InformationNode, self).reset_states()
+        self.
+
     def bottom_up(self):
-        self.xs_uncomb = [[node.zcs, node.zus] for node in [self] + self.parents]
+        xs_uncomb = [[node.zcs, node.zus] for node in self.parents]
         # (N_parents)-list< [(N_samples, node.d_zc)-Tensor, (N_samples, node.d_zu)-Tensor] >
-        self.xcs = self.xs_uncomb[:,0]
-        self.record['xcs'] = tf.stop_gradient(self.xcs)
+        xcs = xs_uncomb[:,0]
+        self.record['xcs'] = tf.stop_gradient(xcs)
         # (N_parents)-list< (N_samples, node.d_zc)-Tensor >
-        self.xus = self.xs_uncomb[:,1]
-        self.record['xus'] = tf.stop_gradient(self.xus)
+        xus = xs_uncomb[:,1]
+        self.record['xus'] = tf.stop_gradient(xus)
         # (N_parents)-list< (N_samples, node.d_zu)-Tensor >
 
         #### self.xs = [ tf.concat([zc, zu], axis=-1) for zc, zu in self.xs_uncomb]
@@ -195,33 +232,31 @@ class InformationNode(Node):
         w_zabs = sum([node.w_zs for node in [self] + self.parents]) # (N_samples,)-Tensor
         # since () can be broadcast onto (N_samples,), it is okay
         # if raw sensors provide a 0-dimensional observation.
-        Zcs = self.f_abs(self.xcs + self.xus) # (B: N_samples, E: self.d_zc)-Dist
+        Zcs = self.f_abs([self.zcs] + xcs + [self.zus] + xus)
+        # (B: N_samples, E: self.d_zc)-Dist
         self.Zc = tfd.MixtureSameFamily(
             mixture_distribution=tfd.Categorical(logits=w_zabs),
-            components_distribution=tf.unstack(Zcs, axis=0)) # (B: E: self.d_zc,)-Dist
+            components_distribution=Zcs
+        ) # (B: E: self.d_zc,)-Dist
 
         self.zcs = self.Zc.sample(N_SAMPLES) # (N_samples, self.d_zc)-Tensor
-        if 'predictive_coding' in self.hparams and self.hparams['predictive_coding'] == True:
-            self.zcs -= self.zcpreds
-            self.record['zcs_pred_prev'] = tf.stop_gradient(self.zcpreds)
+        if self.predictive_coding:
+            self.zcs = keras.activations.relu(self.zcs-self.zcpreds)
         self.w_zs = tf.reduce_mean(w_zabs) \
                     - self.Zc.log_prob(self.zcs) \
                     - self.Zc.entropy() # (N_samples,)-Tensor
         self.zus = tf.expand_dims(self.w_zs, axis=-1) # (N_samples, 1)-Tensor
-        self.record['zus'] = tf.stop_gradient(self.zus)
 
-        Zcpreds = self.f_pred([self.zcs, self.zus])
-        # (B: N_samples, E: d_zc)-Dist
+        Zcpreds = self.f_pred([self.zcs, self.zus]) # (B: N_samples, E: d_zc)-Dist
         Zcpred = tfd.MixtureSameFamily(
             mixture_distribution=tfd.Categorical(logits=self.w_zs),
-            components_distribution=tf.unstack(Zcpreds, axis=0)
+            components_distribution=Zcpreds
         ) # (B: E: self.d_zc)-Dist
-        zcpred_entropy = Zcpred.entropy() # ()-Tensor
         self.zcpreds = Zcpred.sample(N_SAMPLES) # (N_samples, self.d_zc)-Tensor
-        self.zupreds = tf.expand_dims(zcpred_entropy, axis=-1) # (N_samples, 1)-Tensor
         self.w_zcpreds = tf.reduce_mean(self.w_zs) \
                          - Zcpred.log_prob(self.zcpreds) \
-                         - zcpred_entropy # (N_samples,)-Tensor
+                         - Zcpred.entropy() # (N_samples,)-Tensor
+        self.zupreds = tf.expand_dims(self.w_zcpreds, axis=-1) # (N_samples, 1)-Tensor
 
     def top_down(self):
         """
@@ -235,16 +270,16 @@ class InformationNode(Node):
                            ] for neighbor, f_trans in self.neighbors.items()] \
                          + self.child_targets \
                          + [self.w_zcpreds, self.zcpreds]
-        # (N_targets)-list< (node.N_samples,)-Tensor, (B: node.N_samples, E: self.d_zc)-Dist >
-        w_Ztargets = tf.stack(Zwtargets_comb[:, 0], axis=0)
-        # (N_targets x node.N_samples,)-tensor
-        Ztargets = tf.stack(Zwtargets_comb[:, 1], axis=0)
-        # (B: N_targets x node.N_samples, E:self.d_zc)-Dist
+        # (N_targets)-list<[(node.N_samples,)-Tensor, (B: node.N_samples, E: self.d_zc)-Dist]>
+        w_Ztargets = tf.unstack(Zwtargets_comb[:, 0], axis=0)
+        # (N_targets x node.N_samples)-list<()-Tensor>
+        Ztargets = tf.unstack(Zwtargets_comb[:, 1], axis=0)
+        # (N_targets x node.N_samples)-list<(B: E: self.d_zc)-Dist>
         self.Ztarget = tfd.Mixture(
             cat=tfd.Categorical(logits=w_Ztargets),
             components=tf.unstack(Ztargets, axis=0)
         )
-        # (B: E: self.d_zc,)-dist
+        # (B: E: self.d_zc,)-Dist
         ztargets = self.Ztarget.sample(N_SAMPLES)
         self.record['ztargets'] = tf.stop_gradient(ztargets)
         # (N_samples, self.d_zc)-Tensor
@@ -299,7 +334,7 @@ class InformationNode(Node):
                     # train f_abs, f_pred for predictability:
                     # min KL [ f_pred(f_abs(xs_prev)) || self.Z ]
                     Zcs_prev = self.f_abs(prev_record['xcs'] + prev_record['xus'], training=True)
-                    if 'predictive_coding' in self.hparams and self.hparams['predictive_coding'] == True:
+                    if self.predictive_coding:
                         Zcs_prev = tfb.Affine(shifts=-prev_record['zcs_pred_prev']).forward(Zcs_prev)
                         # NOTE: since prev_record['xcs'] came in sample-wise divisions,
                         # it makes sense to continue using those divisions for the
@@ -308,7 +343,7 @@ class InformationNode(Node):
                     zus_prev = tf.expand_dims(Zcs_prev.entropy(), axis=-1)
                     Zc_past_preds = self.f_pred([Zcs_prev, zus_prev])
                     Zcs = self.f_abs(record['xcs'] + record['xus'], training=True)
-                    if 'predictive_coding' in self.hparams and self.hparams['predictive_coding'] == True:
+                    if self.predictive_coding:
                         Zcs = tfb.Affine(shifts=-record['zcs_pred_prev']).forward(Zcs)
                         # NOTE: since record['xcs'] came in sample-wise divisions,
                         # it makes sense to continue using those divisions for the
@@ -350,3 +385,4 @@ class InformationNode(Node):
             self.optimizer.apply_gradients(zip(grad_act, self.w_act))
 
         print(f'{self.name} training complete')
+        self.buffer.clear()
