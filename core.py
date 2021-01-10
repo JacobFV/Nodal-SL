@@ -214,7 +214,9 @@ class InformationNode(Node):
 
     def reset_states(self):
         super(InformationNode, self).reset_states()
-        self.
+        # TODO reset other internal state variables
+        #   use `tf.zeros_like` for simplicity
+        self.record.clear()
 
     def bottom_up(self):
         xs_uncomb = [[node.zcs, node.zus] for node in self.parents]
@@ -226,12 +228,14 @@ class InformationNode(Node):
         self.record['xus'] = tf.stop_gradient(xus)
         # (N_parents)-list< (N_samples, node.d_zu)-Tensor >
 
-        #### self.xs = [ tf.concat([zc, zu], axis=-1) for zc, zu in self.xs_uncomb]
-        #### # (N_parents)-list< (N_samples, node.d_zc+node.d_zu)-Tensor >
-
         w_zabs = sum([node.w_zs for node in [self] + self.parents]) # (N_samples,)-Tensor
+        self.record['w_zabs'] = tf.stop_gradient(w_zabs)
         # since () can be broadcast onto (N_samples,), it is okay
         # if raw sensors provide a 0-dimensional observation.
+
+        self._bottom_up(xcs=xcs, xus=xus, w_zabs=w_zabs)
+
+    def _bottom_up(self, xcs, xus, w_zabs):
         Zcs = self.f_abs([self.zcs] + xcs + [self.zus] + xus)
         # (B: N_samples, E: self.d_zc)-Dist
         self.Zc = tfd.MixtureSameFamily(
@@ -248,14 +252,14 @@ class InformationNode(Node):
         self.zus = tf.expand_dims(self.w_zs, axis=-1) # (N_samples, 1)-Tensor
 
         Zcpreds = self.f_pred([self.zcs, self.zus]) # (B: N_samples, E: d_zc)-Dist
-        Zcpred = tfd.MixtureSameFamily(
+        self.Zcpred = tfd.MixtureSameFamily(
             mixture_distribution=tfd.Categorical(logits=self.w_zs),
             components_distribution=Zcpreds
         ) # (B: E: self.d_zc)-Dist
-        self.zcpreds = Zcpred.sample(N_SAMPLES) # (N_samples, self.d_zc)-Tensor
+        self.zcpreds = self.Zcpred.sample(N_SAMPLES) # (N_samples, self.d_zc)-Tensor
         self.w_zcpreds = tf.reduce_mean(self.w_zs) \
-                         - Zcpred.log_prob(self.zcpreds) \
-                         - Zcpred.entropy() # (N_samples,)-Tensor
+                         - self.Zcpred.log_prob(self.zcpreds) \
+                         - self.Zcpred.entropy() # (N_samples,)-Tensor
         self.zupreds = tf.expand_dims(self.w_zcpreds, axis=-1) # (N_samples, 1)-Tensor
 
     def top_down(self):
@@ -265,14 +269,15 @@ class InformationNode(Node):
         self.record['zcus_neighbors'] = [ tf.stop_gradient([neighbor.zcs, neighbor.zus])
                                            for neighbor, f_trans
                                            in self.neighbors.items()]
+
         Zwtargets_comb = [ [neighbor.w_zcpreds,
                             f_trans([neighbor.zcpreds, neighbor.zupreds])
                            ] for neighbor, f_trans in self.neighbors.items()] \
                          + self.child_targets \
                          + [self.w_zcpreds, self.zcpreds]
         # (N_targets)-list<[(node.N_samples,)-Tensor, (B: node.N_samples, E: self.d_zc)-Dist]>
-        w_Ztargets = tf.unstack(Zwtargets_comb[:, 0], axis=0)
-        # (N_targets x node.N_samples)-list<()-Tensor>
+        w_Ztargets = tf.concat(Zwtargets_comb[:, 0], axis=0)
+        # (N_targets x node.N_samples,)-Tensor
         Ztargets = tf.unstack(Zwtargets_comb[:, 1], axis=0)
         # (N_targets x node.N_samples)-list<(B: E: self.d_zc)-Dist>
         self.Ztarget = tfd.Mixture(
@@ -281,6 +286,8 @@ class InformationNode(Node):
         )
         # (B: E: self.d_zc,)-Dist
         ztargets = self.Ztarget.sample(N_SAMPLES)
+        self.record['zcs'] = tf.stop_gradient(self.zcs) # NOTE: these entries are to only be used
+        self.record['zus'] = tf.stop_gradient(self.zus) # NOTE: for `f_act` training (not `f_pred`)
         self.record['ztargets'] = tf.stop_gradient(ztargets)
         # (N_samples, self.d_zc)-Tensor
         Xparentstargets = self.f_act([self.zcs, self.zus, ztargets])
@@ -306,50 +313,33 @@ class InformationNode(Node):
 
             print(f'Beginning epoch:{epoch} at {time}')
 
+            self.reset_states()
+
             L_abspred = 0.
             L_trans_neighbors = 0.
             L_act = 0.
+            Zcpred_prev = None
 
             with tf.GradientTape() as tape:
 
                 prev_record = None
                 for record in self.buffer:
-                    prev_record = record
+
+                    self._bottom_up(xcs=record['xcs'],
+                                    xus=record['xus'],
+                                    w_zabs=record['w_zabs'])
+
                     if prev_record is None:
+                        prev_record = record
+                        Zcpred_prev = self.Zcpred
                         continue
-
-                    # TODO just stack timesteps into the same batch axis so the
-                    #   resulting tensor is (Nsteps x Nsamples, ...) for batch processing
-                    #   These tensors are already shifted by one time step so it is safe
-                    #   to treat them such a way. If I do stack timesteps, I should only
-                    #   stack the batches in subgroups so the 'Predictive' part of `Node`
-                    #   still has the opportunity to observe its own predictions in training
-                    #   eg: reorganize into batches from the following timesteps: [1,11,21,31],
-                    #   [2,12,22,32],...[9,19,29,39].
-
-                    # TODO: the variable nomenclature has since changed and I should update
-                    #   the comments in psuedocode-math to reflect this. I also need to add shape
-                    #   and type specifications after each statement
+                    else:
+                        prev_record = record
+                        Zcpred_prev = self.Zcpred
 
                     # train f_abs, f_pred for predictability:
-                    # min KL [ f_pred(f_abs(xs_prev)) || self.Z ]
-                    Zcs_prev = self.f_abs(prev_record['xcs'] + prev_record['xus'], training=True)
-                    if self.predictive_coding:
-                        Zcs_prev = tfb.Affine(shifts=-prev_record['zcs_pred_prev']).forward(Zcs_prev)
-                        # NOTE: since prev_record['xcs'] came in sample-wise divisions,
-                        # it makes sense to continue using those divisions for the
-                        # predictive coding subtraction. I will have to write a
-                        # custom Bijector to use rectified subtraction
-                    zus_prev = tf.expand_dims(Zcs_prev.entropy(), axis=-1)
-                    Zc_past_preds = self.f_pred([Zcs_prev, zus_prev])
-                    Zcs = self.f_abs(record['xcs'] + record['xus'], training=True)
-                    if self.predictive_coding:
-                        Zcs = tfb.Affine(shifts=-record['zcs_pred_prev']).forward(Zcs)
-                        # NOTE: since record['xcs'] came in sample-wise divisions,
-                        # it makes sense to continue using those divisions for the
-                        # predictive coding subtraction. I will have to write a
-                        # custom Bijector to use rectified subtraction
-                    L_abspred = L_abspred + Zc_past_preds.kl_divergence(Zcs)
+                    # min KL [ f_pred(f_abs(...[prev step]...)) || self.Z ]
+                    L_abspred = L_abspred + tf.reduce_sum(Zcpred_prev.kl_divergence(self.Zc))
 
                     # train f_trans by association:
                     # min sum [ KL [ f_trans(neighbor.zcs) || self.zcs ] for neighbor in neighbors ]
@@ -358,22 +348,27 @@ class InformationNode(Node):
                                               in zip(list(self.neighbors.values()),
                                                      record['zcus_neighbors'])
                                              ], axis=0)
-                    L_trans_neighbors = L_trans_neighbors + Zcs_neighbors.kl_divergence(Zcs)
+                    # (B: N_neighbors, N_samples, E: self.d_zc)-Dist
+                    # TODO make sure `kl_divergence` can broadcast over 2 batch axes
+                    L_trans_neighbors = L_trans_neighbors + tf.reduce_sum(Zcs_neighbors.kl_divergence(self.Zcs))
 
-                    # train f_act: fit to psuedoinverse from f_abs
-                    # ztarget_prev_samples ~ Ztarget_prev
-                    # min f_act(ztarget_prev_samples).log_prob(xcs)
-                    Xparentstargets_prev = self.f_act([Zcs_prev, zus_prev, prev_record['ztargets']])
-                    L_act = L_act + sum([Xparenttargets_prev.log_prob(parent_xcs)
-                                         for Xparenttargets_prev, parent_xcs
-                                         in zip(Xparentstargets_prev, record['xcs'])])
-                    # also treat f_act as an inverse learner (assuming Zcs_next ~= Ztarget)
-                    # min Err( xcs , f_act(Zcs_prev, zus_prev, Zcs) )
-                    # I actually use log_prob rather than MSE or algebraic error metrics
-                    Xparentstargets_prev = self.f_act([Zcs_prev, zus_prev, Zcs]) # these are `ConvertToTensor`'s
-                    L_act = L_act + sum([Xparenttargets_prev.log_prob(parent_xcs)
-                                         for Xparenttargets_prev, parent_xcs
-                                         in zip(Xparentstargets_prev, record['xcs'])])
+                    # train f_act to fit to 'psuedoinverse' of f_abs
+                    # min f_act(zcs_prev, zus_prev, ztargets_prev).log_prob(xcs)
+                    Xparentstargets_prev = self.f_act([prev_record['zcs'],
+                                                       prev_record['zus'],
+                                                       prev_record['ztargets']])
+                    L_act = L_act + tf.reduce_sum(sum([Xparenttargets_prev.log_prob(parent_xcs)
+                                                       for Xparenttargets_prev, parent_xcs
+                                                       in zip(Xparentstargets_prev, record['xcs'])]))
+
+                    # also treat f_act as an inverse learner (assuming Zcs_next ≈ Ztarget)
+                    # min f_act(zcs_prev, zus_prev, zcs).log_prob(xcs)
+                    Xparentstargets_prev = self.f_act([prev_record['zcs'],
+                                                       prev_record['zus'],
+                                                       record['zcs']])
+                    L_act = L_act + tf.reduce_sum(sum([Xparenttargets_prev.log_prob(parent_xcs)
+                                                       for Xparenttargets_prev, parent_xcs
+                                                       in zip(Xparentstargets_prev, record['xcs'])]))
 
             # get gradients and minimize losses
             grad_abspred = tape.gradient(L_abspred, self.w_abspred)
