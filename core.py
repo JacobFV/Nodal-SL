@@ -2,6 +2,7 @@
 import tensorflow as tf
 keras = tf.keras
 tfkl = keras.layers
+K = keras.backend
 
 import tensorflow_probability as tfp
 tfd = tfp.distributions
@@ -10,6 +11,8 @@ tfpl = tfp.layers
 
 import gym
 import time
+import math
+import logging
 
 N_SAMPLES = 3
 
@@ -56,35 +59,145 @@ def make_f_trans(self, d_zcin, d_zcout):
 
 class Node:
 
-    def __init__(self, d_zc, d_zu):
-        self.d_zc = d_zc
+    NAME_COUNTER = 1
+
+    def __init__(self, name=None):
+        if name is None:
+            name = f'node_{Node.NAME_COUNTER}'
+            Node.NAME_COUNTER += 1
+        self.name = name
+
+
+class UncontrollableNode(Node):
+
+    def __init__(self, d_zu, **kwargs):
+
+        super(UncontrollableNode, self).__init__(**kwargs)
+
         self.d_zu = d_zu
 
-        self.reset_states()
+        self.zus = tf.zeros((N_SAMPLES, self.d_zu,))
+        self.w_zs = tf.zeros((N_SAMPLES,))
 
+    def reset_states(self):
+        """called before beginning a new episode or training on collected data"""
+        self.zus = tf.zeros_like(self.zus)
+        self.w_zs = tf.zeros(self.w_zs)
+
+
+class ControllableNode(Node):
+
+    def __init__(self, d_zc, **kwargs):
+
+        super(ControllableNode, self).__init__(**kwargs)
+        self.d_zc = d_zc
+
+        self.zcs = tf.zeros((N_SAMPLES, self.d_zc,))
+        self.w_zs = tf.zeros((N_SAMPLES,))
         self.child_targets = list() # N-list< [(N_samples)-Tensor, (N_samples,self.d_zc)-Dist] >
 
     def reset_states(self):
         """called before beginning a new episode or training on collected data"""
-        self.zcs = tf.ones((self.d_zc,))
-        self.zus = tf.zeros((self.d_zu,))
+        self.zcs = tf.zeros_like(self.zcs)
+        self.w_zs = tf.zeros(self.w_zs)
+        self.child_targets.clear()
 
-    def bottom_up(self):
+
+class SensoryNode(UncontrollableNode):
+
+    def update_state(self, observation):
         """sensory nodes should override this function to update `self.zcs`"""
-        pass
-    def top_down(self):
+        raise NotImplementedError()
+
+
+class ActuatorNode(ControllableNode):
+
+    def get_action(self):
         """actuator nodes should override this function to attempt to perform `self.child_targets`"""
-        pass
-    def train(self): pass
+        raise NotImplementedError()
 
 
-class InformationNode(Node):
+class LCA(tfkl.Layer):
+
+    def __init__(self,
+                 N_w,
+                 lr_w=1e-3,
+                 winner_take_all=True,
+                 pool_act_axes=[],
+                 backpropagatable=False):
+        super(LCA, self).__init__()
+        self.N_w = N_w
+        self.lr_w = lr_w
+        self.winner_take_all = winner_take_all
+        self.pool_act_axes = pool_act_axes
+        self.backpropagatable = backpropagatable
+
+    def build(self, input_shape):
+        d_x = input_shape[-1] # (1,)-Tensor
+
+        self.ws = tf.random.uniform(shape=(d_x, self.N_w),
+                                    minval=self.minval,
+                                    maxval=self.maxval) # ws: (d_x, N_w)
+        if self.backpropagatable:
+            self.ws = tf.Variable(self.ws, trainable=True)
+
+        self.ws = tf.Variable()
+
+        if not self.winner_take_all:
+            self.batch_norm_layer = tfkl.BatchNormalization(axis=-2)
+
+    def call(self, inputs, **kwargs):
+
+        # inputs: (..., d_x)
+        X = tf.expand_dims(inputs, axis=-1) # (..., d_x, 1)
+        dist = X - self.ws # (..., d_x, N_w)
+        act = tf.exp(-dist**2) # (..., d_x, N_w)
+
+        if self.winner_take_all:
+            ind_ws = K.argmax(act, axis=-1) # (..., 1)
+            act = tf.one_hot(ind_ws, depth=self.N_w, axis=-1) # (..., d_x, N_w)
+        else:
+            act = self.batch_norm_layer(act) # (..., d_x, N_w)
+
+        if 'training' in kwargs and kwargs['training']:
+            # move weights closer to inputs
+            dws = tf.sign(dist) * act # (..., d_x, N_w)
+            sum_axes = tf.range(tf.rank(dws)-3) # (?,)
+            # eg: if `dws.shape=(B, N_x, d_x, N_w)`, then `rank(dws)=4`,
+            # `sum_axes=tf.range(2)=[0,1]`.
+            dws = tf.reduce_sum(dws, axis=sum_axes) # (d_x, N_w)
+            self.ws = self.ws + self.lr_w * dws # (d_x, N_w)
+
+        if len(self.pool_act_axes) > 0:
+            act = K.sum(act, axis=self.pool_act_axes)
+            # eg: for an image, `X.shape=(B, N_y, N_x, N_c, N_w)`
+            # - if `self.pool_act_axes=[-2]`, this performs 1D convolution
+            # - if `self.pool_act_axes=[-4,-3,-2]`, this performs image feature pooling
+            # NOTE: `self.pool_act_axes` should not include the batch axis
+
+        return act # (..., N_w) or some dimensional reduction therefrom
+
+
+class VisionNode(SensoryNode):
+
+    def __init__(self, d_zu, enc=None):
+        super(VisionNode, self).__init__(d_zc=0, d_zu=d_zu)
+
+        if enc is None:
+            enc = LCA(N_w=64, pool_act_axes=[-4,-3,-2])
+        self.enc = enc
+
+    def update_state(self, observation):
+        self.zcs = self.enc(observation, trainable=True)
+
+
+class PredictionNode(UncontrollableNode, ControllableNode):
     """
-    Similar to a node in a Bayesian network, an `InformationNode` has parents forming
+    Similar to a node in a Bayesian network, an `PredictionNode` has parents forming
     its receptive field, children that it directly influences, and neighbors that may
     or may not share the same parents.
 
-    Internally, `InformationNode` builds a recurrent latent representation of its receptive
+    Internally, `PredictionNode` builds a recurrent latent representation of its receptive
     field for next-frame latent representation prediction accuracy. It then acts to fulfill
     the predictions it makes by sending expected observation targets to Nodes in its receptive
     field. It also attempts to fulfill the targets from `Node`'s that it forms the receptive
@@ -93,7 +206,8 @@ class InformationNode(Node):
 
     To prevent zero-representation collapse, `f_abs` should also include some
     unsupervised bottom-up representation mechanisms which the latent state is only
-    able to modify but not completely ignore.Optionally, the anticipated representation
+    able to modify but not completely ignore. Maybe `f_abs` is a latent to latent bijector
+    parametrized by the unsupervised features. Optionally, the anticipated representation
     is subtracted from what is actually formed if `predictive_coding` is enabled.
 
 
@@ -146,8 +260,8 @@ class InformationNode(Node):
     `Line of code returning object # SHAPE-TYPENAME<GENERIC PARAMS>`
     and in pseudocode `obj: SHAPE-TYPENAME<GENERIC PARAMS>`.
     SHAPE and GENERIC PARAMS are optional. eg:
-    `self.nodes = [node1, node2, node3] # 3-list<InformationNode>`
-        means `self.nodes` is a list of 3 `InformationNode` objects
+    `self.nodes = [node1, node2, node3] # 3-list<PredictionNode>`
+        means `self.nodes` is a list of 3 `PredictionNode` objects
     I also use literal `[]`'s to refer to specifically enumerated element types. eg:
     `self.neighbors = list() # (N_neighbors)-list<[node,
         ((N_samples, neighbor.dzc,)-Tensor) -> (B: N_samples, E: self.dzc,)-Dist]>`
@@ -156,10 +270,8 @@ class InformationNode(Node):
     I also employ `inline_var: type` specifications
     For conciseness, I abbreviate `tfp.distributions.Distribution` as `Dist`
 
-    `InformationNode` member functions should all be called in their declared order
+    `PredictionNode` member functions should all be called in their declared order
     """
-
-    NAME_COUNTER = 0
 
     def __init__(self,
                  f_abs,
@@ -169,7 +281,7 @@ class InformationNode(Node):
                  hparams=dict(),
                  name=None):
 
-        super(InformationNode, self).__init__(d_zc=d_zc, d_zu=1)
+        super(PredictionNode, self).__init__(d_zc=d_zc, d_zu=1, name=name)
 
         self.f_abs = f_abs
         self.f_act = f_act
@@ -186,11 +298,6 @@ class InformationNode(Node):
 
         self.predictive_coding = 'predictive_coding' in self.hparams \
                                  and self.hparams['predictive_coding']
-
-        if name is None:
-            name = f'InformationNode{InformationNode.NAME_COUNTER}'
-            InformationNode.NAME_COUNTER += 1
-        self.name = name
 
     def set_parents(self, parents):
         self.parents = parents # list<Node>
@@ -213,9 +320,11 @@ class InformationNode(Node):
         self.optimizer = keras.optimizers.SGD(5e-3)
 
     def reset_states(self):
-        super(InformationNode, self).reset_states()
+        super(PredictionNode, self).reset_states()
         # TODO reset other internal state variables
         #   use `tf.zeros_like` for simplicity
+        self.zcpreds = tf.zeros_like(self.zcpreds)
+        self.w_zcpreds = tf.zeros_like(self.w_zcpreds)
         self.record.clear()
 
     def bottom_up(self):
@@ -227,7 +336,6 @@ class InformationNode(Node):
         xus = xs_uncomb[:,1]
         self.record['xus'] = tf.stop_gradient(xus)
         # (N_parents)-list< (N_samples, node.d_zu)-Tensor >
-
         w_zabs = sum([node.w_zs for node in [self] + self.parents]) # (N_samples,)-Tensor
         self.record['w_zabs'] = tf.stop_gradient(w_zabs)
         # since () can be broadcast onto (N_samples,), it is okay
@@ -305,13 +413,16 @@ class InformationNode(Node):
         """train on most recently observed data.
         should be called after `top_down`
         """
+        t_trainstart = time.time()
+        logging.log(f'beginning {self.name} training at {round(t_trainstart, 3)}')
 
         # NOTE since these are RV's, multiple epochs can
         # glean considerable improvement with little data
         epochs = 5
         for epoch in range(epochs):
 
-            print(f'Beginning epoch:{epoch} at {time}')
+            t_epochstart = time.time()
+            logging.log(f'Beginning epoch:{epoch} at {round(t_epochstart, 3)}')
 
             self.reset_states()
 
@@ -329,13 +440,12 @@ class InformationNode(Node):
                                     xus=record['xus'],
                                     w_zabs=record['w_zabs'])
 
+                    Zcpred_prev = self.Zcpred
                     if prev_record is None:
                         prev_record = record
-                        Zcpred_prev = self.Zcpred
                         continue
                     else:
                         prev_record = record
-                        Zcpred_prev = self.Zcpred
 
                     # train f_abs, f_pred for predictability:
                     # min KL [ f_pred(f_abs(...[prev step]...)) || self.Z ]
@@ -371,13 +481,46 @@ class InformationNode(Node):
                                                        in zip(Xparentstargets_prev, record['xcs'])]))
 
             # get gradients and minimize losses
+            logging.log(f'Getting gradients. Time elapsed: {round(time.time() - t_epochstart, 3)}s')
             grad_abspred = tape.gradient(L_abspred, self.w_abspred)
             grad_trans_neighbors = tape.gradient(L_trans_neighbors, self.w_trans_neighbors)
             grad_act = tape.gradient(L_act, self.w_act)
 
+            logging.log(f'Applying gradients. Time elapsed: {round(time.time()-t_epochstart, 3)}s')
             self.optimizer.apply_gradients(zip(grad_abspred, self.w_abspred))
             self.optimizer.apply_gradients(zip(grad_trans_neighbors, self.w_trans_neighbors))
             self.optimizer.apply_gradients(zip(grad_act, self.w_act))
 
-        print(f'{self.name} training complete')
+            logging.log(f'Epoch completed. Time elapsed: {round(time.time() - t_epochstart, 3)}s\n'+ 32*'-')
+
+        logging.log(f'{self.name} training complete. Time elapsed: {round(t_trainstart, 3)}s\n'+ 32*'=')
         self.buffer.clear()
+
+
+class Organism:
+
+    def __init__(self, prediction_nodes, sensory_nodes, actuator_nodes):
+        """predictions nodes should've been pre-structured"""
+        self.prediction_nodes = prediction_nodes
+        self.sensory_nodes = sensory_nodes
+        self.actuator_nodes = actuator_nodes
+
+    def act(self, observations):
+        """recieves and returns dict<str,any> structured observations and actions"""
+        self.write_sensors(observations)
+        self.thinking_step()
+        return self.read_actuators()
+
+    def write_sensors(self, observations):
+        for sensory_node in self.sensory_nodes:
+            sensory_node.update_state(observations[sensory_node.name])
+
+    def read_actuators(self):
+        return { actuator_node.name: actuator_node.get_action
+                 for actuator_node in self.actuator_nodes }
+
+    def thinking_step(self):
+        for prediction_node in self.prediction_nodes:
+            prediction_node.bottom_up()
+        for prediction_node in self.prediction_nodes:
+            prediction_node.top_down()
