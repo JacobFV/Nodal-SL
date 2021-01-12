@@ -1,4 +1,3 @@
-#%tensorflow_version 2.x
 import tensorflow as tf
 keras = tf.keras
 tfkl = keras.layers
@@ -9,9 +8,8 @@ tfd = tfp.distributions
 tfb = tfp.bijectors
 tfpl = tfp.layers
 
-import gym
 import time
-import math
+import random
 import logging
 
 N_SAMPLES = 3
@@ -103,14 +101,14 @@ class ControllableNode(Node):
         self.child_targets.clear()
 
 
-class SensoryNode(UncontrollableNode):
+class SensoryNode(ControllableNode, UncontrollableNode):
 
     def update_state(self, observation):
         """sensory nodes should override this function to update `self.zcs`"""
         raise NotImplementedError()
 
 
-class ActuatorNode(ControllableNode):
+class ActuatorNode(ControllableNode, UncontrollableNode):
 
     def get_action(self):
         """actuator nodes should override this function to attempt to perform `self.child_targets`"""
@@ -143,52 +141,204 @@ class LCA(tfkl.Layer):
 
         self.ws = tf.Variable()
 
-        if not self.winner_take_all:
-            self.batch_norm_layer = tfkl.BatchNormalization(axis=-2)
+        # if not self.winner_take_all:
+        #     self.batch_norm_layer = tfkl.BatchNormalization(axis=-2)
 
     def call(self, inputs, **kwargs):
 
         # inputs: (..., d_x)
         X = tf.expand_dims(inputs, axis=-1) # (..., d_x, 1)
-        dist = X - self.ws # (..., d_x, N_w)
-        act = tf.exp(-dist**2) # (..., d_x, N_w)
+        delta = X - self.ws # (..., d_x, N_w)
+        dist = tf.norm(delta, ord=1, axis=-2) # (..., N_w)
+        act = tf.exp(-dist) # (..., N_w)
 
         if self.winner_take_all:
             ind_ws = K.argmax(act, axis=-1) # (..., 1)
-            act = tf.one_hot(ind_ws, depth=self.N_w, axis=-1) # (..., d_x, N_w)
-        else:
-            act = self.batch_norm_layer(act) # (..., d_x, N_w)
+            act = tf.one_hot(ind_ws, depth=self.N_w, axis=-1) # (..., N_w)
+        # else:
+        #     act = self.batch_norm_layer(act) # (..., N_w)
 
         if 'training' in kwargs and kwargs['training']:
             # move weights closer to inputs
-            dws = tf.sign(dist) * act # (..., d_x, N_w)
+            dws = tf.sign(delta) * act[..., tf.newaxis, :] # (..., d_x, N_w)
             sum_axes = tf.range(tf.rank(dws)-3) # (?,)
             # eg: if `dws.shape=(B, N_x, d_x, N_w)`, then `rank(dws)=4`,
-            # `sum_axes=tf.range(2)=[0,1]`.
+            # `sum_axes=tf.range(1)=[0,1]`. take sum over batch and input x axes.
             dws = tf.reduce_sum(dws, axis=sum_axes) # (d_x, N_w)
             self.ws = self.ws + self.lr_w * dws # (d_x, N_w)
 
         if len(self.pool_act_axes) > 0:
-            act = K.sum(act, axis=self.pool_act_axes)
-            # eg: for an image, `X.shape=(B, N_y, N_x, N_c, N_w)`
-            # - if `self.pool_act_axes=[-2]`, this performs 1D convolution
-            # - if `self.pool_act_axes=[-4,-3,-2]`, this performs image feature pooling
-            # NOTE: `self.pool_act_axes` should not include the batch axis
+            act = tf.reduce_sum(act, axis=self.pool_act_axes)
+            # eg: for an image, `X.shape=(B, N_y, N_x, N_c)`, `(B, N_y, N_x)` become the 'batch' axes
+            # while the channels form the weight space. As a result, `act.shape=(B, N_y, N_x, N_w)`.
+            # - if `self.pool_act_axes=[]`, this performs 1D convolution
+            # - if `self.pool_act_axes=[-3,-2]`, this performs global feature pooling
 
         return act # (..., N_w) or some dimensional reduction therefrom
 
 
-class VisionNode(SensoryNode):
+class Conv2DLCA(LCA):
 
-    def __init__(self, d_zu, enc=None):
-        super(VisionNode, self).__init__(d_zc=0, d_zu=d_zu)
+    def __init__(self,
+                 filters,
+                 kernel_size=(3,3),
+                 strides=1,
+                 padding='valid',
+                 lr_w=1e-3,
+                 winner_take_all=True,
+                 backpropagatable=False):
 
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        assert isinstance(kernel_size, tuple) and len(kernel_size) == 2
+        self.kernel_size = tf.constant(kernel_size)
+
+        if isinstance(strides, int):
+            strides = (strides, strides)
+        assert isinstance(strides, tuple) and len(strides) == 2
+        self.strides = tf.constant(strides)
+
+        padding = padding.lower().strip()
+        assert padding == 'valid' or padding == 'same'
+        self.padding = padding
+
+        super(Conv2DLCA, self).__init__(N_w=filters,
+                                        lr_w=lr_w,
+                                        winner_take_all=winner_take_all,
+                                        pool_act_axes=[],
+                                        backpropagatable=backpropagatable)
+
+    def build(self, input_shape):
+        pass
+
+    def call(self, inputs, **kwargs):
+
+        tf.assert_rank(inputs, 4) # [B, Y, X, C]
+        # you must add an empty dimension (`[..., None]`)
+        # to feed greyscale images to this Conv2D layer
+        kernel_cutoff = (self.kernel_size-1)//2
+
+        # pad so opposite edges don't roll over to each other
+        padded_image = tf.pad(inputs, [(0, 0),
+                                       (kernel_cutoff[0], kernel_cutoff[0]),
+                                       (kernel_cutoff[1], kernel_cutoff[1]),
+                                       (0, 0)])
+
+        # stagger stack axis 1
+        y_staggered_stack = tf.concat([
+            tf.roll(input=padded_image, shift=N, axis=1)
+            for N in range(-kernel_cutoff[0], kernel_cutoff[0]+1)
+        ], axis=-1)
+
+        # stagger stack axis 2
+        xy_staggered_stack = tf.concat([
+            tf.roll(input=y_staggered_stack, shift=N, axis=2)
+            for N in range(-kernel_cutoff[1], kernel_cutoff[1]+1)
+        ], axis=-1)
+
+        # cutoff padding
+        if self.padding == 'same':
+            cropped_image = xy_staggered_stack[:,
+                                               kernel_cutoff[0]:-kernel_cutoff[0],
+                                               kernel_cutoff[1]:-kernel_cutoff[1],
+                                               :]
+        elif self.padding == 'valid':
+            cropped_image = xy_staggered_stack[:,
+                                               2*kernel_cutoff[0]:-2*kernel_cutoff[0],
+                                               2*kernel_cutoff[1]:-2*kernel_cutoff[1],
+                                               :]
+        else:
+            raise NotImplementedError()
+
+        super(Conv2DLCA, self).call(cropped_image, **kwargs)
+
+
+class DepthwiseConv2DLCA(tfkl.Layer):
+
+    def __init__(self, name=None, **kwargs):
+        self.kwargs = kwargs
+        super(DepthwiseConv2DLCA, self).__init__(name=name)
+
+    def build(self, input_shape):
+        assert input_shape.size == 4
+        N_channels = input_shape[-1]
+        self.channel_convs = [Conv2DLCA(self.kwargs) for _ in range(N_channels)]
+        self.final_conv = Conv2DLCA(self.kwargs)
+
+    def call(self, inputs, **kwargs):
+        tf.assert_rank(inputs, 4) # [B, Y, X, C]
+        channel_images = tf.unstack(inputs, axis=-1)
+        channel_activations = [channel_conv(channel_image, **kwargs)
+                                   for channel_conv, channel_image
+                                   in zip(self.channel_convs, channel_images)]
+        final_activations = self.final_conv(channel_activations, **kwargs)
+        return final_activations
+
+
+class Vision2DNode(SensoryNode):
+    """
+    zc: y_accel: (? exponential coefficient bases),
+        x_accel: (? exponential coefficient bases),
+        pupil_zoom_rate: (1)
+    zu: features: (feature_depth,)
+    """
+
+    def __init__(self,
+                 feature_depth,
+                 image_size,
+                 pupil_size,
+                 max_pupil_zoom,
+                 max_speed=None,
+                 enc=None):
+
+        self.image_size = tf.constant(image_size)
+        self.pupil_size_after_scaling = pupil_size
+        self.max_pupil_zoom = max_pupil_zoom
+        self.pupil_zoom = (1 + self.max_pupil_zoom) / 2
+        self.pos = self.image_size // 2
+        self.vel = tf.ones(2)
+        if max_speed is None:
+            max_speed = self.pupil_size_on_canvas // 2
+        self.max_speed = max_speed
+        self.accel_coef = tf.exp(tf.range(tf.math.log(self.max_speed)+1))
         if enc is None:
-            enc = LCA(N_w=64, pool_act_axes=[-4,-3,-2])
+            enc = DepthwiseConv2DLCA(name='eye', filters=feature_depth)
         self.enc = enc
 
-    def update_state(self, observation):
-        self.zcs = self.enc(observation, trainable=True)
+        super(Vision2DNode, self).__init__(d_zc=2*self.accel_coef+1, d_zu=feature_depth)
+
+    @property
+    def pupil_size_on_canvas(self):
+        return tf.cast(self.pupil_size_after_scaling * self.pupil_zoom, tf.int32)
+
+    def update_state(self, image):
+        if tf.rank(image) == 3:
+            image = image[..., tf.newaxis]
+        elif tf.rank(image) == 4:
+            pass
+        else:
+            raise NotImplementedError()
+
+        sample_index = random.randint(0, N_SAMPLES-1)
+        self.zcs = self.child_targets[-1]
+        self.child_targets.clear()
+
+        pupil_zoom_rate = self.zcs[sample_index, -1]
+        self.pupil_zoom = tf.clip_by_value(self.pupil_zoom + pupil_zoom_rate, 1., self.max_pupil_zoom)
+
+        accel = tf.reshape(self.zcs[sample_index, 0:-1], shape=(2, -1))
+        self.vel = tf.clip_by_value(self.vel + accel, 0, self.max_speed)
+        self.pos = tf.clip_by_value(self.pos + self.vel,
+                                    self.pupil_size_on_canvas // 2,
+                                    self.image_size - (self.pupil_size_on_canvas // 2))
+
+        cropped_image = tf.image.crop_to_bounding_box(image,
+                                                      self.pos[0] - (self.pupil_size_on_canvas // 2),
+                                                      self.pos[1] - (self.pupil_size_on_canvas // 2),
+                                                      self.pupil_size_on_canvas[0],
+                                                      self.pupil_size_on_canvas[1])
+        rescaled_image = tf.image.resize(cropped_image, self.pupil_size_after_scaling)
+        self.zus = self.enc(cropped_image, trainable=True)
 
 
 class PredictionNode(UncontrollableNode, ControllableNode):
@@ -278,7 +428,7 @@ class PredictionNode(UncontrollableNode, ControllableNode):
                  f_act,
                  f_pred,
                  d_zc=8,
-                 hparams=dict(),
+                 predictive_coding=False,
                  name=None):
 
         super(PredictionNode, self).__init__(d_zc=d_zc, d_zu=1, name=name)
@@ -288,16 +438,14 @@ class PredictionNode(UncontrollableNode, ControllableNode):
         self.f_pred = f_pred
 
         self.parents = list() # list<Node>
-        self.neighbors = dict() # dict< Node, callable>
+        self.neighbors = list() # list<[Node, callable]>
         # callable is the controllable latent translator:
         # ((N_samples, neighbor.d_zc)-Tensor)->(N_samples, self.d_zc)-Tensor
 
-        self.hparams = hparams
         self.record = dict() # `record` is progressively defined during bottom_up and top_down
         self.buffer = list() # list<dict<str, Tensor>>
 
-        self.predictive_coding = 'predictive_coding' in self.hparams \
-                                 and self.hparams['predictive_coding']
+        self.predictive_coding = predictive_coding
 
     def set_parents(self, parents):
         self.parents = parents # list<Node>
@@ -423,16 +571,13 @@ class PredictionNode(UncontrollableNode, ControllableNode):
 
             t_epochstart = time.time()
             logging.log(f'Beginning epoch:{epoch} at {round(t_epochstart, 3)}')
-
             self.reset_states()
-
-            L_abspred = 0.
-            L_trans_neighbors = 0.
-            L_act = 0.
-            Zcpred_prev = None
-
             with tf.GradientTape() as tape:
 
+                L_abspred = 0.
+                L_trans_neighbors = 0.
+                L_act = 0.
+                Zcpred_prev = None
                 prev_record = None
                 for record in self.buffer:
 
@@ -499,27 +644,31 @@ class PredictionNode(UncontrollableNode, ControllableNode):
 
 class Organism:
 
-    def __init__(self, prediction_nodes, sensory_nodes, actuator_nodes):
+    def __init__(self, nodes):
         """predictions nodes should've been pre-structured"""
-        self.prediction_nodes = prediction_nodes
-        self.sensory_nodes = sensory_nodes
-        self.actuator_nodes = actuator_nodes
+        self.sensory_nodes = [node for node in nodes if isinstance(node, SensoryNode)]
+        self.actuator_nodes = [node for node in nodes if isinstance(node, ActuatorNode)]
+        self.prediction_nodes = [node for node in nodes if isinstance(node, PredictionNode)]
+
+    def train(self):
+        for prediction_node in self.prediction_nodes:
+            prediction_node.train()
 
     def act(self, observations):
         """recieves and returns dict<str,any> structured observations and actions"""
-        self.write_sensors(observations)
-        self.thinking_step()
-        return self.read_actuators()
+        self._write_sensors(observations)
+        self._thinking_step()
+        return self._read_actuators()
 
-    def write_sensors(self, observations):
+    def _write_sensors(self, observations):
         for sensory_node in self.sensory_nodes:
             sensory_node.update_state(observations[sensory_node.name])
 
-    def read_actuators(self):
+    def _read_actuators(self):
         return { actuator_node.name: actuator_node.get_action
                  for actuator_node in self.actuator_nodes }
 
-    def thinking_step(self):
+    def _thinking_step(self):
         for prediction_node in self.prediction_nodes:
             prediction_node.bottom_up()
         for prediction_node in self.prediction_nodes:
