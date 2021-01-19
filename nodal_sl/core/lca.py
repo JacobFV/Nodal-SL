@@ -177,7 +177,7 @@ class Conv2DLCA(LCA):
 
     def call(self, inputs, **kwargs):
         cropped_image = self._preprocess_image(inputs)
-        super(Conv2DLCA, self).call(cropped_image, **kwargs)
+        return super(Conv2DLCA, self).call(cropped_image, **kwargs)
 
     def _preprocess_image(self, inputs):
         tf.assert_rank(inputs, 4) # [B, Y, X, C]
@@ -237,6 +237,7 @@ class DepthwiseConv2DLCA(tfkl.Layer):
         channel_activations = [channel_conv(channel_image[..., tf.newaxis], **kwargs)
                                for channel_conv, channel_image
                                in zip(self.channel_convs, channel_images)]
+        channel_activations = tf.concat(channel_activations, axis=-1)
         final_activations = self.final_conv(channel_activations, **kwargs)
         return final_activations
 
