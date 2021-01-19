@@ -1,58 +1,154 @@
+from .lca import SemisupervisedLCA
+
 import tensorflow as tf
-keras = tf.keras
-tfkl = keras.layers
-K = keras.backend
-
 import tensorflow_probability as tfp
-tfd = tfp.distributions
-tfb = tfp.bijectors
-tfpl = tfp.layers
-
 import time
 import random
 import logging
 
+keras = tf.keras
+tfkl = keras.layers
+K = keras.backend
+
+tfd = tfp.distributions
+tfb = tfp.bijectors
+tfpl = tfp.layers
+
 N_SAMPLES = 3
 
-def prior(kernel_size, bias_size, dtype=None):
-    n = kernel_size + bias_size
-    return lambda t: tfd.Independent(tfd.Normal(
-        loc=tf.zeros(n, dtype=dtype), scale=1),
-        reinterpreted_batch_ndims=1)
 
-def posterior(kernel_size, bias_size, dtype=None):
-    n = kernel_size + bias_size
-    return keras.Sequential([
-        tfpl.VariableLayer(tfpl.IndependentNormal.params_size(n), dtype=dtype),
-        tfpl.IndependentNormal(n) ])
+def make_abs_act_pair():
 
-def make_f_pred(d_zc, d_zu):
+    def prior(kernel_size, bias_size, dtype=None):
+        n = kernel_size + bias_size
+        return lambda t: tfd.Independent(tfd.Normal(
+            loc=tf.zeros(n, dtype=dtype), scale=1),
+            reinterpreted_batch_ndims=1)
 
-    f_pred = keras.Sequential([
-        tfkl.Input(shape=(d_zc+d_zu,))
-        tfpl.DenseVariational(
-            units=2*d_zc,
-            make_posterior_fn=posterior,
-            make_prior_fn=prior,
-            kl_weight=1/N,
-            activation='relu'),
-        tfpl.DenseVariational(
-            units=2*d_zc,
-            make_posterior_fn=posterior,
-            make_prior_fn=prior,
-            kl_weight=1/N,
-            activation='relu'),
-        tfpl.IndependentNormal(event_shape=(d_zc,))
-    ])
+    def posterior(kernel_size, bias_size, dtype=None):
+        n = kernel_size + bias_size
+        return keras.Sequential([
+            tfpl.VariableLayer(tfpl.IndependentNormal.params_size(n), dtype=dtype),
+            tfpl.IndependentNormal(n)])
 
-    f_pred.compile(loss=lambda y_true, y_pred: -y_pred.log_prob(y_true))
+    class DynamicActor(tfkl.Layer):
+        def __init__(self, **kwargs):
+            super(DynamicActor, self).__init__(**kwargs)
 
-    return f_pred
+            self.parent_nets = list()
 
-def make_f_trans(self, d_zcin, d_zcout):
-    pass # TODO
-    # input tensor
-    # output distribution
+        def build(self, input_shape):
+            self.d_zc = input_shape[0][-1]
+            self.d_zu = input_shape[1][-1]
+
+            self.foreward_model = keras.Sequential([
+                tfkl.Dense(self.d_zc + self.d_zu, activation='relu'),
+                tfpl.DenseVariational(self.d_zc,
+                                      make_posterior_fn=posterior,
+                                      make_prior_fn=prior,
+                                      kl_weight=1 / 256,
+                                      activation='relu'),
+                tfkl.Dense(self.d_zc, activation='relu')
+            ])
+
+        def call(self, inputs, **kwargs):
+            inpts_concat = tfkl.concatenate(inputs)
+            hidden = self.foreward_model(inpts_concat)
+            return [parent_net(hidden) for parent_net in self.parent_nets]
+
+        def set_parent_shapes(self, shapes):
+            for shape in shapes:
+                def parent_target(x):
+                    x = tfkl.Dense(shape[-1], activation='relu')(x)
+                    loc = tfkl.Dense(shape[-1], activation='relu')(x)
+                    scale = tfkl.Dense(shape[-1], activation='relu')(x)
+                    return tfd.Normal(loc=loc, scale=scale)
+                self.parent_nets.append(parent_target)
+
+    class DynamicAbstractor(tfkl.Layer):
+
+        def __init__(self, dynamic_actor, **kwargs):
+            super(DynamicAbstractor, self).__init__(**kwargs)
+            self.dynamic_actor = dynamic_actor
+
+        def build(self, input_shape):
+            N_parents = (len(input_shape) // 2) - 1
+            self.d_zc = input_shape[0]
+            self.d_zu = input_shape[N_parents+1]
+
+            self.dynamic_actor.set_parent_shapes(input_shape[1:N_parents]+input_shape[N_parents+1:])
+
+            zc_inpts = list()
+            zu_inpts = list()
+            parents = list()
+            for i in range(1,1+N_parents):
+                d_zci = input_shape[i][-1]
+                d_zui = input_shape[1+N_parents+i][-1]
+                zci_inpt = tfkl.Input((d_zci,))
+                zui_inpt = tfkl.Input((d_zui,))
+                zi_cat = tfkl.Concatenate()([zci_inpt, zui_inpt])
+                hidi1 = SemisupervisedLCA(d_supervised=d_zci//2, d_unsupervised=d_zci//2, N_splits=4)(zi_cat)
+                hidi2 = SemisupervisedLCA(d_supervised=self.d_zc//2, d_unsupervised=self.d_zc//2, N_splits=4)(hidi1)
+
+                zc_inpts.append(zci_inpt)
+                zu_inpts.append(zui_inpt)
+                parents.append(hidi2)
+
+            parents_combined = tfkl.Add(name=f'{self.name}_parents_combined')(parents)
+
+            zcself_inpt = tfkl.Input((self.d_zc,))
+            zuself_inpt = tfkl.Input((self.d_zu,))
+            zself_cat = tfkl.Concatenate()([zcself_inpt, zuself_inpt])
+
+            N_heads = 4
+            d_key = self.d_zc // 2
+            d_val = d_key * 2
+            make_transformer_compatible = tfkl.Lambda(lambda x: x[...,None,:])
+            qs = [tfkl.Dense(d_key, activation='relu')(make_transformer_compatible(zself_cat))
+                  for _ in range(N_heads)]
+            vs = [tfkl.Dense(d_val, activation='relu')(make_transformer_compatible(parents_combined))
+                  for _ in range(N_heads)]
+            ks = [tfkl.Dense(d_key, activation='relu')(make_transformer_compatible(parents_combined))
+                  for _ in range(N_heads)]
+            attended_vals = [tfkl.Attention(use_scale=True)([q,v,k])
+                             for q, v, k in zip(qs, vs, ks)]
+            final_cat = tfkl.Concatenate()([attended_vals, zself_cat])
+            final1 = SemisupervisedLCA(d_supervised=self.d_zc//2,
+                                       d_unsupervised=self.d_zc-(self.d_zc//2),
+                                       N_splits=4)(final_cat)
+
+            self.model = keras.Model(
+                inputs=[zcself_inpt]+zc_inpts+[zuself_inpt]+zu_inpts,
+                outputs=final1
+            )
+
+        def call(self, inputs, **kwargs):
+            return self.model(inputs=inputs, **kwargs)
+
+    dynamic_actor = DynamicActor()
+    dynamic_abstractor = DynamicAbstractor(dynamic_actor=dynamic_actor)
+    return dynamic_abstractor, dynamic_actor
+
+
+def make_tensor_to_dist(d_zcin, d_zuin, d_zcout):
+
+    zcs_inpt = tfkl.Input((d_zcin,))
+    zus_inpt = tfkl.Input((d_zuin,))
+    hid0 = tfkl.Concatenate()([zcs_inpt, zus_inpt])
+    hidA1 = tfkl.Dense(d_zcin//2, activation='relu')(hid0)
+    hidA2 = tfkl.Dense(tfpl.IndependentNormal.params_size(event_shape=(d_zcin//4,)), activation='relu')(hidA1)
+    hidA3 = tfpl.IndependentNormal(event_shape=(d_zcin//4,))(hidA2)
+
+    hidB1 = tfkl.Concatenate()([hid0, hidA3])
+    hidB2 = tfkl.Dense(d_zcout, activation='relu')(hidB1)
+    loc = tfkl.Dense(d_zcout, activation='relu')(hidB2)
+    scale = tfkl.Dense(d_zcout, activation='relu')(hidB2)
+
+    output = tfpl.DistributionLambda(
+        make_distribution_fn=lambda locscale:
+            tfd.Normal(loc=locscale[0], scale=locscale[1]))([loc, scale])
+
+    return keras.Model(inputs=[zcs_inpt, zus_inpt], outputs=[output])
 
 
 class Node:
@@ -71,16 +167,15 @@ class UncontrollableNode(Node):
     def __init__(self, d_zu, **kwargs):
 
         super(UncontrollableNode, self).__init__(**kwargs)
-
         self.d_zu = d_zu
 
         self.zus = tf.zeros((N_SAMPLES, self.d_zu,))
-        self.w_zs = tf.zeros((N_SAMPLES,))
+        self.w_zs = tf.ones((N_SAMPLES,))
 
     def reset_states(self):
         """called before beginning a new episode or training on collected data"""
-        self.zus = tf.zeros_like(self.zus)
-        self.w_zs = tf.zeros(self.w_zs)
+        self.zus = tf.zeros((N_SAMPLES, self.d_zu,))
+        self.w_zs = tf.ones((N_SAMPLES,))
 
 
 class ControllableNode(Node):
@@ -91,17 +186,26 @@ class ControllableNode(Node):
         self.d_zc = d_zc
 
         self.zcs = tf.zeros((N_SAMPLES, self.d_zc,))
-        self.w_zs = tf.zeros((N_SAMPLES,))
-        self.child_targets = list() # N-list< [(N_samples)-Tensor, (N_samples,self.d_zc)-Dist] >
+        self.w_zs = tf.ones((N_SAMPLES,))
+        self.child_targets = [[
+            self.w_zs, tfd.Normal(loc=self.zcs, scale=1e-1)
+        ]] # N-list< [(N_samples)-Tensor, (N_samples,self.d_zc)-Dist] >
 
     def reset_states(self):
         """called before beginning a new episode or training on collected data"""
-        self.zcs = tf.zeros_like(self.zcs)
-        self.w_zs = tf.zeros(self.w_zs)
-        self.child_targets.clear()
+        self.zcs = tf.zeros((N_SAMPLES, self.d_zc,))
+        self.w_zs = tf.ones((N_SAMPLES,))
+        self.child_targets = [[
+            self.w_zs, tfd.Normal(loc=self.zcs, scale=1e-1)
+        ]] # N-list< [(N_samples)-Tensor, (N_samples,self.d_zc)-Dist] >
 
 
 class SensoryNode(ControllableNode, UncontrollableNode):
+    # TODO make SensoryNode `have` nodes but not be a node
+
+    def __init__(self, **kwargs):
+        super(SensoryNode, self).__init__(**kwargs)
+        self.reset_states()
 
     def update_state(self, observation):
         """sensory nodes should override this function to update `self.zcs`"""
@@ -109,236 +213,15 @@ class SensoryNode(ControllableNode, UncontrollableNode):
 
 
 class ActuatorNode(ControllableNode, UncontrollableNode):
+    # TODO make ActuatorNode `have` nodes but not be a node
+
+    def __init__(self, **kwargs):
+        super(ActuatorNode, self).__init__(**kwargs)
+        self.reset_states()
 
     def get_action(self):
         """actuator nodes should override this function to attempt to perform `self.child_targets`"""
         raise NotImplementedError()
-
-
-class LCA(tfkl.Layer):
-
-    def __init__(self,
-                 N_w,
-                 lr_w=1e-3,
-                 winner_take_all=True,
-                 pool_act_axes=[],
-                 backpropagatable=False):
-        super(LCA, self).__init__()
-        self.N_w = N_w
-        self.lr_w = lr_w
-        self.winner_take_all = winner_take_all
-        self.pool_act_axes = pool_act_axes
-        self.backpropagatable = backpropagatable
-
-    def build(self, input_shape):
-        d_x = input_shape[-1] # (1,)-Tensor
-
-        self.ws = tf.random.uniform(shape=(d_x, self.N_w),
-                                    minval=self.minval,
-                                    maxval=self.maxval) # ws: (d_x, N_w)
-        if self.backpropagatable:
-            self.ws = tf.Variable(self.ws, trainable=True)
-
-        self.ws = tf.Variable()
-
-        # if not self.winner_take_all:
-        #     self.batch_norm_layer = tfkl.BatchNormalization(axis=-2)
-
-    def call(self, inputs, **kwargs):
-
-        # inputs: (..., d_x)
-        X = tf.expand_dims(inputs, axis=-1) # (..., d_x, 1)
-        delta = X - self.ws # (..., d_x, N_w)
-        dist = tf.norm(delta, ord=1, axis=-2) # (..., N_w)
-        act = tf.exp(-dist) # (..., N_w)
-
-        if self.winner_take_all:
-            ind_ws = K.argmax(act, axis=-1) # (..., 1)
-            act = tf.one_hot(ind_ws, depth=self.N_w, axis=-1) # (..., N_w)
-        # else:
-        #     act = self.batch_norm_layer(act) # (..., N_w)
-
-        if 'training' in kwargs and kwargs['training']:
-            # move weights closer to inputs
-            dws = tf.sign(delta) * act[..., tf.newaxis, :] # (..., d_x, N_w)
-            sum_axes = tf.range(tf.rank(dws)-3) # (?,)
-            # eg: if `dws.shape=(B, N_x, d_x, N_w)`, then `rank(dws)=4`,
-            # `sum_axes=tf.range(1)=[0,1]`. take sum over batch and input x axes.
-            dws = tf.reduce_sum(dws, axis=sum_axes) # (d_x, N_w)
-            self.ws = self.ws + self.lr_w * dws # (d_x, N_w)
-
-        if len(self.pool_act_axes) > 0:
-            act = tf.reduce_sum(act, axis=self.pool_act_axes)
-            # eg: for an image, `X.shape=(B, N_y, N_x, N_c)`, `(B, N_y, N_x)` become the 'batch' axes
-            # while the channels form the weight space. As a result, `act.shape=(B, N_y, N_x, N_w)`.
-            # - if `self.pool_act_axes=[]`, this performs 1D convolution
-            # - if `self.pool_act_axes=[-3,-2]`, this performs global feature pooling
-
-        return act # (..., N_w) or some dimensional reduction therefrom
-
-
-class Conv2DLCA(LCA):
-
-    def __init__(self,
-                 filters,
-                 kernel_size=(3,3),
-                 strides=1,
-                 padding='valid',
-                 lr_w=1e-3,
-                 winner_take_all=True,
-                 backpropagatable=False):
-
-        if isinstance(kernel_size, int):
-            kernel_size = (kernel_size, kernel_size)
-        assert isinstance(kernel_size, tuple) and len(kernel_size) == 2
-        self.kernel_size = tf.constant(kernel_size)
-
-        if isinstance(strides, int):
-            strides = (strides, strides)
-        assert isinstance(strides, tuple) and len(strides) == 2
-        self.strides = tf.constant(strides)
-
-        padding = padding.lower().strip()
-        assert padding == 'valid' or padding == 'same'
-        self.padding = padding
-
-        super(Conv2DLCA, self).__init__(N_w=filters,
-                                        lr_w=lr_w,
-                                        winner_take_all=winner_take_all,
-                                        pool_act_axes=[],
-                                        backpropagatable=backpropagatable)
-
-    def build(self, input_shape):
-        pass
-
-    def call(self, inputs, **kwargs):
-
-        tf.assert_rank(inputs, 4) # [B, Y, X, C]
-        # you must add an empty dimension (`[..., None]`)
-        # to feed greyscale images to this Conv2D layer
-        kernel_cutoff = (self.kernel_size-1)//2
-
-        # pad so opposite edges don't roll over to each other
-        padded_image = tf.pad(inputs, [(0, 0),
-                                       (kernel_cutoff[0], kernel_cutoff[0]),
-                                       (kernel_cutoff[1], kernel_cutoff[1]),
-                                       (0, 0)])
-
-        # stagger stack axis 1
-        y_staggered_stack = tf.concat([
-            tf.roll(input=padded_image, shift=N, axis=1)
-            for N in range(-kernel_cutoff[0], kernel_cutoff[0]+1)
-        ], axis=-1)
-
-        # stagger stack axis 2
-        xy_staggered_stack = tf.concat([
-            tf.roll(input=y_staggered_stack, shift=N, axis=2)
-            for N in range(-kernel_cutoff[1], kernel_cutoff[1]+1)
-        ], axis=-1)
-
-        # cutoff padding
-        if self.padding == 'same':
-            cropped_image = xy_staggered_stack[:,
-                                               kernel_cutoff[0]:-kernel_cutoff[0],
-                                               kernel_cutoff[1]:-kernel_cutoff[1],
-                                               :]
-        elif self.padding == 'valid':
-            cropped_image = xy_staggered_stack[:,
-                                               2*kernel_cutoff[0]:-2*kernel_cutoff[0],
-                                               2*kernel_cutoff[1]:-2*kernel_cutoff[1],
-                                               :]
-        else:
-            raise NotImplementedError()
-
-        super(Conv2DLCA, self).call(cropped_image, **kwargs)
-
-
-class DepthwiseConv2DLCA(tfkl.Layer):
-
-    def __init__(self, name=None, **kwargs):
-        self.kwargs = kwargs
-        super(DepthwiseConv2DLCA, self).__init__(name=name)
-
-    def build(self, input_shape):
-        assert input_shape.size == 4
-        N_channels = input_shape[-1]
-        self.channel_convs = [Conv2DLCA(self.kwargs) for _ in range(N_channels)]
-        self.final_conv = Conv2DLCA(self.kwargs)
-
-    def call(self, inputs, **kwargs):
-        tf.assert_rank(inputs, 4) # [B, Y, X, C]
-        channel_images = tf.unstack(inputs, axis=-1)
-        channel_activations = [channel_conv(channel_image, **kwargs)
-                                   for channel_conv, channel_image
-                                   in zip(self.channel_convs, channel_images)]
-        final_activations = self.final_conv(channel_activations, **kwargs)
-        return final_activations
-
-
-class Vision2DNode(SensoryNode):
-    """
-    zc: y_accel: (? exponential coefficient bases),
-        x_accel: (? exponential coefficient bases),
-        pupil_zoom_rate: (1)
-    zu: features: (feature_depth,)
-    """
-
-    def __init__(self,
-                 feature_depth,
-                 image_size,
-                 pupil_size,
-                 max_pupil_zoom,
-                 max_speed=None,
-                 enc=None):
-
-        self.image_size = tf.constant(image_size)
-        self.pupil_size_after_scaling = pupil_size
-        self.max_pupil_zoom = max_pupil_zoom
-        self.pupil_zoom = (1 + self.max_pupil_zoom) / 2
-        self.pos = self.image_size // 2
-        self.vel = tf.ones(2)
-        if max_speed is None:
-            max_speed = self.pupil_size_on_canvas // 2
-        self.max_speed = max_speed
-        self.accel_coef = tf.exp(tf.range(tf.math.log(self.max_speed)+1))
-        if enc is None:
-            enc = DepthwiseConv2DLCA(name='eye', filters=feature_depth)
-        self.enc = enc
-
-        super(Vision2DNode, self).__init__(d_zc=2*self.accel_coef+1, d_zu=feature_depth)
-
-    @property
-    def pupil_size_on_canvas(self):
-        return tf.cast(self.pupil_size_after_scaling * self.pupil_zoom, tf.int32)
-
-    def update_state(self, image):
-        if tf.rank(image) == 3:
-            image = image[..., tf.newaxis]
-        elif tf.rank(image) == 4:
-            pass
-        else:
-            raise NotImplementedError()
-
-        sample_index = random.randint(0, N_SAMPLES-1)
-        self.zcs = self.child_targets[-1]
-        self.child_targets.clear()
-
-        pupil_zoom_rate = self.zcs[sample_index, -1]
-        self.pupil_zoom = tf.clip_by_value(self.pupil_zoom + pupil_zoom_rate, 1., self.max_pupil_zoom)
-
-        accel = tf.reshape(self.zcs[sample_index, 0:-1], shape=(2, -1))
-        self.vel = tf.clip_by_value(self.vel + accel, 0, self.max_speed)
-        self.pos = tf.clip_by_value(self.pos + self.vel,
-                                    self.pupil_size_on_canvas // 2,
-                                    self.image_size - (self.pupil_size_on_canvas // 2))
-
-        cropped_image = tf.image.crop_to_bounding_box(image,
-                                                      self.pos[0] - (self.pupil_size_on_canvas // 2),
-                                                      self.pos[1] - (self.pupil_size_on_canvas // 2),
-                                                      self.pupil_size_on_canvas[0],
-                                                      self.pupil_size_on_canvas[1])
-        rescaled_image = tf.image.resize(cropped_image, self.pupil_size_after_scaling)
-        self.zus = self.enc(cropped_image, trainable=True)
 
 
 class PredictionNode(UncontrollableNode, ControllableNode):
@@ -381,7 +264,7 @@ class PredictionNode(UncontrollableNode, ControllableNode):
             -> self.Zcs: (B: N_samples E: self.d_zc)`
 
     `f_pred: [self.zcs: (N_samples, self.d_zc),
-              self.zus: (self.d_zu)]
+              self.zus: (N_samples, self.d_zu)]
              -> self.Zcpreds (B: N_samples E: self.d_zc)`
 
     `f_act: [self.zcs: (N_samples, self.d_zc),
@@ -424,14 +307,21 @@ class PredictionNode(UncontrollableNode, ControllableNode):
     """
 
     def __init__(self,
-                 f_abs,
-                 f_act,
-                 f_pred,
-                 d_zc=8,
-                 predictive_coding=False,
+                 f_abs=None,
+                 f_act=None,
+                 f_pred=None,
+                 d_zc=16,
+                 predictive_coding=True,
                  name=None):
 
         super(PredictionNode, self).__init__(d_zc=d_zc, d_zu=1, name=name)
+        #self.reset_states()
+
+        if f_abs is None and f_act is None:
+            f_abs, f_act = make_abs_act_pair()
+
+        if f_pred is None:
+            f_pred = make_tensor_to_dist(d_zcin=self.d_zc, d_zuin=self.d_zu, d_zcout=self.d_zc)
 
         self.f_abs = f_abs
         self.f_act = f_act
@@ -447,41 +337,45 @@ class PredictionNode(UncontrollableNode, ControllableNode):
 
         self.predictive_coding = predictive_coding
 
-    def set_parents(self, parents):
-        self.parents = parents # list<Node>
+        self._is_built = False
 
-    def set_neighbors(self, neighbors):
-        self.neighbors = [
-            (neighbor, make_f_trans(d_zcin=neighbor.zcs.shape,
-                                    d_zcout=self.zcs.shape[-1]))
-            for neighbor in neighbors]
+    def add_parents(self, parents):
+        self.parents.extend(parents)
+
+    def add_neighbors(self, neighbors):
+        self.neighbors.extend([
+            (neighbor, make_tensor_to_dist(
+                d_zcin=neighbor.d_zc, d_zuin=neighbor.d_zu, d_zcout=self.d_zc))
+            for neighbor in neighbors])
 
     # def set_children(self, children):
     #    self.children = {child:None for child in children}
 
     def build(self):
+        if self._is_built:
+            return
+        self.parents = list(set(self.parents))
+        self.neighbors = list(set(self.neighbors))
         self.w_abspred = self.f_abs.trainable_weights + self.f_pred.trainable_weights
         self.w_trans_neighbors = list()
-        for _, f_trans in self.neighbors.items():
+        for elem in self.neighbors:
+            _, f_trans = elem
             self.w_trans_neighbors.extend(f_trans.trainable_weights)
         self.w_act = self.f_act.trainable_weights
         self.optimizer = keras.optimizers.SGD(5e-3)
+        self._is_built = True
 
     def reset_states(self):
         super(PredictionNode, self).reset_states()
-        # TODO reset other internal state variables
-        #   use `tf.zeros_like` for simplicity
-        self.zcpreds = tf.zeros_like(self.zcpreds)
-        self.w_zcpreds = tf.zeros_like(self.w_zcpreds)
+        self.zcpreds = tf.zeros_like(self.zcs)
+        self.w_zcpreds = tf.zeros_like(self.w_zs)
         self.record.clear()
 
     def bottom_up(self):
-        xs_uncomb = [[node.zcs, node.zus] for node in self.parents]
-        # (N_parents)-list< [(N_samples, node.d_zc)-Tensor, (N_samples, node.d_zu)-Tensor] >
-        xcs = xs_uncomb[:,0]
+        xcs = [node.zcs for node in self.parents]
         self.record['xcs'] = tf.stop_gradient(xcs)
         # (N_parents)-list< (N_samples, node.d_zc)-Tensor >
-        xus = xs_uncomb[:,1]
+        xus = [node.zcs for node in self.parents]
         self.record['xus'] = tf.stop_gradient(xus)
         # (N_parents)-list< (N_samples, node.d_zu)-Tensor >
         w_zabs = sum([node.w_zs for node in [self] + self.parents]) # (N_samples,)-Tensor
@@ -641,35 +535,3 @@ class PredictionNode(UncontrollableNode, ControllableNode):
         logging.log(f'{self.name} training complete. Time elapsed: {round(t_trainstart, 3)}s\n'+ 32*'=')
         self.buffer.clear()
 
-
-class Organism:
-
-    def __init__(self, nodes):
-        """predictions nodes should've been pre-structured"""
-        self.sensory_nodes = [node for node in nodes if isinstance(node, SensoryNode)]
-        self.actuator_nodes = [node for node in nodes if isinstance(node, ActuatorNode)]
-        self.prediction_nodes = [node for node in nodes if isinstance(node, PredictionNode)]
-
-    def train(self):
-        for prediction_node in self.prediction_nodes:
-            prediction_node.train()
-
-    def act(self, observations):
-        """recieves and returns dict<str,any> structured observations and actions"""
-        self._write_sensors(observations)
-        self._thinking_step()
-        return self._read_actuators()
-
-    def _write_sensors(self, observations):
-        for sensory_node in self.sensory_nodes:
-            sensory_node.update_state(observations[sensory_node.name])
-
-    def _read_actuators(self):
-        return { actuator_node.name: actuator_node.get_action
-                 for actuator_node in self.actuator_nodes }
-
-    def _thinking_step(self):
-        for prediction_node in self.prediction_nodes:
-            prediction_node.bottom_up()
-        for prediction_node in self.prediction_nodes:
-            prediction_node.top_down()
